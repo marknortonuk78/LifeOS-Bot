@@ -8,7 +8,7 @@ const { execSync } = require('child_process');
 // Configuration
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const GITHUB_REPO = process.env.GITHUB_REPO || 'marknortonuk/LifeOS';
+const GITHUB_REPO = process.env.GITHUB_REPO || 'marknortonuk78/LifeOS';
 const LIFEOS_PATH = path.join(__dirname, 'lifeos-vault');
 
 if (!GROQ_API_KEY) {
