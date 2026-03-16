@@ -1,5 +1,6 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const Groq = require('groq-sdk');
 const fs = require('fs');
 const path = require('path');
@@ -74,9 +75,26 @@ const client = new Client({
     }
 });
 
-client.on('qr', (qr) => {
-    console.log('Scan this QR code with WhatsApp:');
+client.on('qr', async (qr) => {
+    console.log('QR code generated. Saving to GitHub...');
     qrcode.generate(qr, { small: true });
+
+    // Save QR as image and push to GitHub for easy scanning
+    try {
+        const qrImagePath = path.join(LIFEOS_PATH, 'whatsapp-qr.png');
+        await QRCode.toFile(qrImagePath, qr, { width: 300 });
+        execSync('git add whatsapp-qr.png', { cwd: LIFEOS_PATH });
+        execSync('git commit -m "WhatsApp QR code - scan to connect"', { cwd: LIFEOS_PATH });
+        execSync('git push', { cwd: LIFEOS_PATH });
+        console.log('');
+        console.log('==============================================');
+        console.log('QR CODE SAVED! View it here:');
+        console.log(`https://github.com/${GITHUB_REPO}/blob/main/whatsapp-qr.png`);
+        console.log('==============================================');
+        console.log('');
+    } catch (error) {
+        console.error('Failed to save QR to GitHub:', error.message);
+    }
 });
 
 client.on('ready', () => {
