@@ -1,7 +1,8 @@
 FROM node:20-slim
 
-# Install Chromium dependencies
+# Install Chromium dependencies and git
 RUN apt-get update && apt-get install -y \
+    git \
     chromium \
     fonts-liberation \
     libasound2 \
