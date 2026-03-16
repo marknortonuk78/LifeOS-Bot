@@ -162,7 +162,7 @@ ${text}
     return filename;
 }
 
-client.on('message', async (message) => {
+client.on('message_create', async (message) => {
     try {
         if (message.hasMedia && (message.type === 'ptt' || message.type === 'audio')) {
             console.log('Voice note received, processing...');
