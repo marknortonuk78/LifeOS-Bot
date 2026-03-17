@@ -6,6 +6,23 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
+// Global error handlers to prevent crashes
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught Exception:', err.message);
+    console.error(err.stack);
+    // Don't exit - try to keep running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    // Don't exit - try to keep running
+});
+
+// Heartbeat to keep the process alive and prevent idle timeout
+setInterval(() => {
+    console.log(`[${new Date().toISOString()}] Heartbeat - bot is running`);
+}, 60000); // Log every minute
+
 // Configuration
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -28,13 +45,25 @@ const groq = new Groq({ apiKey: GROQ_API_KEY });
 
 // Git operations
 function setupRepo() {
+    const gitDir = path.join(LIFEOS_PATH, '.git');
+
+    // If directory exists but isn't a valid git repo, remove it
+    if (fs.existsSync(LIFEOS_PATH) && !fs.existsSync(gitDir)) {
+        console.log('Found invalid repo directory, removing...');
+        fs.rmSync(LIFEOS_PATH, { recursive: true, force: true });
+    }
+
     if (!fs.existsSync(LIFEOS_PATH)) {
         console.log('Cloning LifeOS repo...');
         const repoUrl = `https://${GITHUB_TOKEN}@github.com/${GITHUB_REPO}.git`;
         execSync(`git clone ${repoUrl} ${LIFEOS_PATH}`, { stdio: 'inherit' });
     } else {
         console.log('Pulling latest changes...');
-        execSync('git pull', { cwd: LIFEOS_PATH, stdio: 'inherit' });
+        try {
+            execSync('git pull', { cwd: LIFEOS_PATH, stdio: 'inherit' });
+        } catch (e) {
+            console.error('Git pull failed, continuing anyway:', e.message);
+        }
     }
 
     // Configure git user for commits
@@ -44,6 +73,7 @@ function setupRepo() {
 
 function commitAndPush(filename, message) {
     try {
+        execSync('git pull --rebase', { cwd: LIFEOS_PATH, stdio: 'inherit' });
         execSync(`git add "${filename}"`, { cwd: LIFEOS_PATH });
         execSync(`git commit -m "${message}"`, { cwd: LIFEOS_PATH });
         execSync('git push', { cwd: LIFEOS_PATH });
@@ -61,60 +91,147 @@ if (!fs.existsSync(INBOX_PATH)) {
     fs.mkdirSync(INBOX_PATH, { recursive: true });
 }
 
-const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: './whatsapp-session' }),
-    puppeteer: {
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--single-process'
-        ]
+// Clear Chromium lock files that can cause issues after container restarts
+const sessionPath = './whatsapp-session';
+const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+if (fs.existsSync(sessionPath)) {
+    for (const lockFile of lockFiles) {
+        try {
+            execSync(`find ${sessionPath} -name "${lockFile}" -delete 2>/dev/null || true`);
+        } catch (e) {
+            // Ignore errors
+        }
     }
-});
+    console.log('Cleared any stale Chromium lock files');
+}
 
-client.on('qr', async (qr) => {
-    console.log('QR code generated. Saving to GitHub...');
-    qrcode.generate(qr, { small: true });
+let client = null;
+let isReconnecting = false;
 
-    // Save QR as image and push to GitHub for easy scanning
-    try {
-        const qrImagePath = path.join(LIFEOS_PATH, 'whatsapp-qr.png');
-        await QRCode.toFile(qrImagePath, qr, { width: 300 });
-        execSync('git add whatsapp-qr.png', { cwd: LIFEOS_PATH });
-        execSync('git commit -m "WhatsApp QR code - scan to connect"', { cwd: LIFEOS_PATH });
-        execSync('git push', { cwd: LIFEOS_PATH });
-        console.log('');
-        console.log('==============================================');
-        console.log('QR CODE SAVED! View it here:');
-        console.log(`https://github.com/${GITHUB_REPO}/blob/main/whatsapp-qr.png`);
-        console.log('==============================================');
-        console.log('');
-    } catch (error) {
-        console.error('Failed to save QR to GitHub:', error.message);
+function createClient() {
+    return new Client({
+        authStrategy: new LocalAuth({ dataPath: sessionPath }),
+        puppeteer: {
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--single-process',
+                '--no-zygote',
+                '--disable-accelerated-2d-canvas',
+                '--disable-software-rasterizer',
+                '--disable-extensions'
+            ]
+        },
+        restartOnAuthFail: true
+    });
+}
+
+function setupClientEvents(client) {
+    client.on('qr', async (qr) => {
+        console.log('QR code generated. Saving to GitHub...');
+        qrcode.generate(qr, { small: true });
+
+        try {
+            const qrImagePath = path.join(LIFEOS_PATH, 'whatsapp-qr.png');
+            await QRCode.toFile(qrImagePath, qr, { width: 300 });
+            execSync('git pull --rebase || true', { cwd: LIFEOS_PATH });
+            execSync('git add whatsapp-qr.png', { cwd: LIFEOS_PATH });
+            execSync('git commit -m "WhatsApp QR code - scan to connect"', { cwd: LIFEOS_PATH });
+            execSync('git push', { cwd: LIFEOS_PATH });
+            console.log('');
+            console.log('==============================================');
+            console.log('QR CODE SAVED! View it here:');
+            console.log(`https://github.com/${GITHUB_REPO}/blob/main/whatsapp-qr.png`);
+            console.log('==============================================');
+            console.log('');
+        } catch (error) {
+            console.error('Failed to save QR to GitHub:', error.message);
+        }
+    });
+
+    client.on('ready', () => {
+        console.log('WhatsApp bot is ready!');
+        console.log('Send voice notes to yourself to transcribe them to LifeOS Inbox.');
+        isReconnecting = false;
+    });
+
+    client.on('authenticated', () => {
+        console.log('Authenticated successfully');
+    });
+
+    client.on('auth_failure', (msg) => {
+        console.error('Authentication failed:', msg);
+        scheduleReconnect();
+    });
+
+    client.on('disconnected', (reason) => {
+        console.log('Client disconnected:', reason);
+        scheduleReconnect();
+    });
+
+    client.on('message_create', async (message) => {
+        try {
+            if (message.hasMedia && (message.type === 'ptt' || message.type === 'audio')) {
+                console.log('Voice note received, processing...');
+
+                const media = await message.downloadMedia();
+
+                if (!media) {
+                    console.error('Failed to download media');
+                    return;
+                }
+
+                const audioBuffer = Buffer.from(media.data, 'base64');
+
+                console.log('Transcribing...');
+                const text = await transcribeAudio(audioBuffer);
+                console.log('Transcription:', text);
+
+                const filename = await saveToInbox(text);
+
+                await message.reply(`Saved to LifeOS: ${filename}`);
+            }
+        } catch (error) {
+            console.error('Error processing message:', error);
+            try {
+                await message.reply('Error processing voice note. Check logs.');
+            } catch (e) {
+                console.error('Failed to send error reply:', e.message);
+            }
+        }
+    });
+}
+
+function scheduleReconnect() {
+    if (isReconnecting) {
+        console.log('Already attempting to reconnect...');
+        return;
     }
-});
-
-client.on('ready', () => {
-    console.log('WhatsApp bot is ready!');
-    console.log('Send voice notes to yourself to transcribe them to LifeOS Inbox.');
-});
-
-client.on('authenticated', () => {
-    console.log('Authenticated successfully');
-});
-
-client.on('auth_failure', (msg) => {
-    console.error('Authentication failed:', msg);
-});
-
-client.on('disconnected', (reason) => {
-    console.log('Client disconnected:', reason);
-    console.log('Attempting to reconnect...');
-    setTimeout(() => client.initialize(), 5000);
-});
+    isReconnecting = true;
+    console.log('Scheduling reconnect in 10 seconds...');
+    setTimeout(async () => {
+        try {
+            console.log('Attempting to reconnect...');
+            if (client) {
+                try {
+                    await client.destroy();
+                } catch (e) {
+                    console.log('Error destroying old client:', e.message);
+                }
+            }
+            client = createClient();
+            setupClientEvents(client);
+            await client.initialize();
+        } catch (error) {
+            console.error('Reconnect failed:', error.message);
+            isReconnecting = false;
+            scheduleReconnect();
+        }
+    }, 10000);
+}
 
 async function transcribeAudio(audioBuffer) {
     const tempPath = path.join(__dirname, `temp_audio_${Date.now()}.ogg`);
@@ -133,22 +250,46 @@ async function transcribeAudio(audioBuffer) {
     }
 }
 
-function saveToInbox(text) {
+async function generateTitle(text) {
+    try {
+        const response = await groq.chat.completions.create({
+            model: 'llama-3.1-8b-instant',
+            messages: [{
+                role: 'user',
+                content: `Generate a very short title (3-5 words max) summarizing this voice note. Only respond with the title, nothing else. No quotes or punctuation.\n\nVoice note: "${text}"`
+            }],
+            max_tokens: 20,
+            temperature: 0.3
+        });
+        let title = response.choices[0].message.content.trim();
+        // Sanitize for filename: remove special chars, replace spaces with hyphens
+        title = title.replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '-').toLowerCase();
+        return title || 'voice-note';
+    } catch (error) {
+        console.error('Failed to generate title:', error.message);
+        return 'voice-note';
+    }
+}
+
+async function saveToInbox(text) {
     const now = new Date();
     const dateStr = now.toISOString().split('T')[0];
-    const timeStr = now.toTimeString().split(' ')[0].replace(/:/g, '-');
-    const filename = `${dateStr}-${timeStr}-voice-note.md`;
+    const timeStr = now.toTimeString().split(' ')[0];
+
+    // Generate smart title
+    const title = await generateTitle(text);
+    const filename = `${title}.md`;
     const filepath = path.join(INBOX_PATH, filename);
     const relativePath = path.join('Inbox', filename);
 
     const content = `---
 created: ${dateStr}
-time: ${now.toTimeString().split(' ')[0]}
+time: ${timeStr}
 source: whatsapp-voice
 tags: [inbox, voice-note]
 ---
 
-# Voice Note
+# ${title.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}
 
 ${text}
 `;
@@ -157,38 +298,16 @@ ${text}
     console.log(`Saved to: ${filepath}`);
 
     // Commit and push to GitHub
-    commitAndPush(relativePath, `Add voice note: ${filename}`);
+    commitAndPush(relativePath, `Add voice note: ${title}`);
 
     return filename;
 }
 
-client.on('message_create', async (message) => {
-    try {
-        if (message.hasMedia && (message.type === 'ptt' || message.type === 'audio')) {
-            console.log('Voice note received, processing...');
-
-            const media = await message.downloadMedia();
-
-            if (!media) {
-                console.error('Failed to download media');
-                return;
-            }
-
-            const audioBuffer = Buffer.from(media.data, 'base64');
-
-            console.log('Transcribing...');
-            const text = await transcribeAudio(audioBuffer);
-            console.log('Transcription:', text);
-
-            const filename = saveToInbox(text);
-
-            await message.reply(`Saved to LifeOS: ${filename}`);
-        }
-    } catch (error) {
-        console.error('Error processing message:', error);
-        await message.reply('Error processing voice note. Check logs.');
-    }
-});
-
+// Start the bot
 console.log('Starting WhatsApp bot...');
-client.initialize();
+client = createClient();
+setupClientEvents(client);
+client.initialize().catch(err => {
+    console.error('Failed to initialize client:', err.message);
+    scheduleReconnect();
+});
