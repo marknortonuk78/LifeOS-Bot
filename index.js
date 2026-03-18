@@ -174,6 +174,11 @@ function setupClientEvents(client) {
 
     client.on('message_create', async (message) => {
         try {
+            // Only process voice notes sent by me (not from groups or other people)
+            if (!message.fromMe) {
+                return;
+            }
+
             if (message.hasMedia && (message.type === 'ptt' || message.type === 'audio')) {
                 console.log('Voice note received, processing...');
 
